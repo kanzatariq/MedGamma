@@ -1,0 +1,140 @@
+import os
+import json
+import random
+import torch
+from PIL import Image
+from huggingface_hub import login
+from transformers import AutoProcessor, Gemma3ForConditionalGeneration, BitsAndBytesConfig
+from weasyprint import HTML
+
+def setup_environment():
+    """Initializes authentication and loads the quantized model parameters."""
+    # Fetch token from environment variable for security
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        print("Authenticating with Hugging Face token from environment...")
+        login(token=hf_token)
+    else:
+        print("⚠️ Warning: No HF_TOKEN environment variable found. Attempting optional public access...")
+
+    print("Loading MedGemma 3 weights into local GPU memory...")
+    model_id = "google/medgemma-1.5-4b-it"
+    
+    # 4-Bit quantization settings for memory efficiency
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True, 
+        bnb_4bit_compute_dtype=torch.float16
+    )
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = Gemma3ForConditionalGeneration.from_pretrained(
+        model_id, 
+        quantization_config=quantization_config, 
+        device_map="auto"
+    )
+    return processor, model
+
+def generate_medical_report(processor, model, templates_json_path, new_patient_image_path):
+    """Executes multi-shot prompting and runs inference on the target medical image."""
+    # 1. Load context templates
+    with open(templates_json_path, 'r') as f:
+        templates = json.load(f)
+    
+    # 2. Extract random historical examples for few-shot learning
+    selected_templates = random.sample(templates, min(len(templates), 2))
+    images_list = []
+    conversation = []
+    
+    # 3. Build multi-image chat history sequence
+    for t in selected_templates:
+        images_list.append(Image.open(t['image_path']).convert("RGB"))
+        conversation.append({
+            "role": "user",
+            "content": [
+                {"type": "image"}, 
+                {"type": "text", "text": t['prompt_text']}
+            ]
+        })
+        conversation.append({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": t['expected_output']}
+            ]
+        })
+    
+    # 4. Append target patient scan
+    images_list.append(Image.open(new_patient_image_path).convert("RGB"))
+    conversation.append({
+        "role": "user",
+        "content": [
+            {"type": "image"}, 
+            {"type": "text", "text": "Analyze this medical image context and provide the clinical assessment."}
+        ]
+    })
+
+    # 5. Process prompt arrays through chat template wrapper
+    prompt_text = processor.apply_chat_template(conversation, add_generation_prompt=True)
+    inputs = processor(text=prompt_text, images=images_list, return_tensors="pt").to("cuda")
+    
+    # 6. Execute vision-language inference
+    print("Running visual-clinical diagnostic inference...")
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=500)
+    
+    output_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return output_text.split("assistant")[-1].strip()
+
+def export_to_pdf(report_text, output_filename="clinical_report.pdf"):
+    """Compiles raw text into a stylized HTML framework and prints out a PDF file."""
+    print(f"Compiling diagnostic report into {output_filename}...")
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <style>
+        @page {{ size: A4; margin: 20mm 15mm; }}
+        body {{ font-family: sans-serif; color: #1a202c; line-height: 1.6; }}
+        .header {{ border-bottom: 2px solid #2b6cb0; padding-bottom: 10px; margin-bottom: 20px; }}
+        .title {{ color: #2b6cb0; font-size: 20pt; font-weight: bold; margin: 0; }}
+        .content {{ white-space: pre-wrap; background: #f7fafc; padding: 15px; border-radius: 6px; border: 1px solid #e2e8f0; }}
+        .disclaimer {{ margin-top: 30px; border-left: 4px solid #dd6b20; background: #fffaf0; padding: 10px; font-size: 9pt; }}
+    </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="title">MedGemma Diagnostic Report</div>
+            <p style="margin: 4px 0 0 0; color: #4a5568;">Automated Multimodal Imaging AI Analysis</p>
+        </div>
+        <div class="content">{report_text}</div>
+        <div class="disclaimer">
+            <strong>Clinical Disclaimer:</strong> Generated autonomously by AI for experimental research validation. Must be authenticated by a certified clinical expert.
+        </div>
+    </body>
+    </html>
+    """
+    
+    with open("temp_report.html", "w") as f:
+        f.write(html_content)
+        
+    HTML("temp_report.html").write_pdf(output_filename)
+    os.remove("temp_report.html")
+    print("PDF Generation complete successfully!")
+
+if __name__ == "__main__":
+    # Define relative target paths for execution
+    TEMPLATES_PATH = "data/perfect_medgemma_templates.json"
+    TARGET_SCAN_PATH = "data/sample_scan.jpg"
+    OUTPUT_PDF_PATH = "output/medgemma_clinical_report.pdf"
+
+    # Verify input directories exist before processing
+    if not os.path.exists(TEMPLATES_PATH) or not os.path.exists(TARGET_SCAN_PATH):
+        print(f"❌ Error: Please ensure input files exist at '{TEMPLATES_PATH}' and '{TARGET_SCAN_PATH}'")
+    else:
+        # Step-by-step pipeline execution
+        proc, mdg_model = setup_environment()
+        final_report = generate_medical_report(proc, mdg_model, TEMPLATES_PATH, TARGET_SCAN_PATH)
+        
+        # Ensure output folder exists
+        os.makedirs("output", exist_ok=True)
+        export_to_pdf(final_report, OUTPUT_PDF_PATH)
